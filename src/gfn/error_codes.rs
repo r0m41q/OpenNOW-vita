@@ -604,6 +604,10 @@ impl GfnErrorCode {
                 "error-gfn-session-limit-exceeded-title",
                 "error-gfn-session-limit-exceeded-body",
             ),
+            Self::REQUEST_LIMIT_EXCEEDED => (
+                "error-gfn-rate-limited-title",
+                "error-gfn-rate-limited-body",
+            ),
             Self::SESSION_ENTITLED_TIME_EXCEEDED => (
                 "error-gfn-session-entitled-time-exceeded-title",
                 "error-gfn-session-entitled-time-exceeded-body",
