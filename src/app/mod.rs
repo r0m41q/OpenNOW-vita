@@ -1186,7 +1186,6 @@ impl App {
             }
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::RestartLogin,
                     ..
                 },
@@ -1194,7 +1193,6 @@ impl App {
             ) => self.start_login_state(),
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::ReloadCatalog(user),
                     ..
                 },
@@ -1210,7 +1208,6 @@ impl App {
             }
             (
                 AppState::Error {
-                    code: None,
                     retry:
                         ErrorRetry::BackToCatalog {
                             user,
@@ -1238,7 +1235,6 @@ impl App {
             // recoverable as a failed launch.
             (
                 AppState::Error {
-                    code: None,
                     retry:
                         ErrorRetry::BackToCatalog {
                             user,
@@ -1263,7 +1259,6 @@ impl App {
             },
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::ReloadCatalog(user),
                     ..
                 },
@@ -1279,7 +1274,6 @@ impl App {
             }
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::RestartLogin,
                     ..
                 },
