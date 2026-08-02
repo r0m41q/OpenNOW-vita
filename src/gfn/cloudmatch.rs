@@ -131,164 +131,60 @@ pub async fn create_session(
         "{base_url}/v2/session?keyboardLayout={DEFAULT_KEYBOARD_LAYOUT}&languageCode={DEFAULT_LOCALE}"
     );
 
-    // Clear the decks first. Anything still open would reject this launch anyway, and finding that
-    // out from a 403 costs the player a failed launch and two cleanup rounds.
+    // Clear the decks first. Anything still open would reject this launch anyway.
     //
-    // our own note goes first, its the only thing that survives a crash and knows the zone
+    // our own note goes first, its the only thing that survives a crash and knows the zone.
+    // this is one DELETE of a session we recorded, no listing, no waiting - exactly what
+    // OpenNOW-Switch's CleanupStaleCloudSession does.
     stop_remembered_session(client, request.token, &identity).await;
-    stop_active_sessions_before_launch(client, request.token, &identity, base_url).await;
 
-    let send_request = || async {
-        let mut last_err = None;
-        let mut throttled = 0u32;
-        for _retry in 0..6 {
-            let response = headers::apply_cloudmatch_headers(
-                client.post(&url),
-                request.token,
-                &identity.client_id,
-                &identity.device_id,
-            )
-            .header("Connection", "close")
-            .json(&body)
-            .send()
-            .await;
+    // A single POST, exactly like OpenNOW-Switch's StartSession. CloudMatch rate-limits bursts
+    // of launch attempts with 429 (`REQUEST_LIMIT_EXCEEDED`), and retrying into that window only
+    // keeps the flag armed - the reference client fails immediately and so do we.
+    let response = headers::apply_cloudmatch_headers(
+        client.post(&url),
+        request.token,
+        &identity.client_id,
+        &identity.device_id,
+    )
+    .json(&body)
+    .send()
+    .await
+    .context("CloudMatch create session request failed")?;
 
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let headers = resp.headers().clone();
-                    let body_text = resp.text().await.unwrap_or_default();
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
 
-                    if status.is_success() {
-                        let payload: CloudMatchResponse = serde_json::from_str(&body_text)
-                            .context("failed to decode CloudMatch create session response")?;
-                        if payload.request_status.status_code == 1 {
-                            return Ok((payload, false));
-                        }
-                        if payload.request_status.is_session_limit()
-                            && stop_conflicting_sessions(
-                                client,
-                                request.token,
-                                Some(&payload),
-                                &identity,
-                                base_url,
-                            )
-                            .await
-                        {
-                            return Ok((payload, true));
-                        }
-                        return Err(payload.request_status.to_error(format!(
-                            "CloudMatch create session error {} ({}): {body_text}",
-                            payload.request_status.status_code,
-                            payload.request_status.describe()
-                        ))
-                        .with_http_status(status.as_u16())
-                        .into());
-                    }
-
-                    if status == reqwest::StatusCode::FORBIDDEN
-                        || body_text.to_ascii_uppercase().contains("SESSION_LIMIT")
-                    {
-                        // still try cleanup even if body doesnt decode, falls back to
-                        // asking cloudmatch whats open
-                        let limit_payload =
-                            serde_json::from_str::<CloudMatchResponse>(&body_text).ok();
-                        if stop_conflicting_sessions(
-                            client,
-                            request.token,
-                            limit_payload.as_ref(),
-                            &identity,
-                            base_url,
-                        )
-                        .await
-                            && let Some(limit_payload) = limit_payload
-                        {
-                            return Ok((limit_payload, true));
-                        }
-                        if let Some(limit_payload) = limit_payload {
-                            return Err(limit_payload.request_status.to_error(format!(
-                                "CloudMatch create session error {} ({}): {body_text}",
-                                limit_payload.request_status.status_code,
-                                limit_payload.request_status.describe()
-                            ))
-                            .with_http_status(status.as_u16())
-                            .into());
-                        }
-                    }
-
-                    // CloudMatch rate-limits bursts of launch attempts with 429
-                    // (`REQUEST_LIMIT_EXCEEDED`), and sheds load with 5xx while a zone is busy.
-                    // Both clear on their own, so they get honoured with a backoff instead of
-                    // failing the launch on the first reply.
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-                    {
-                        throttled += 1;
-                        let wait = retry_after(&headers)
-                            .unwrap_or_else(|| Duration::from_secs(2 << throttled.min(3)));
-                        eprintln!(
-                            "CloudMatch replied {status}, waiting {:?} before retry {throttled}",
-                            wait
-                        );
-                        sleep(wait).await;
-                        continue;
-                    }
-
-                    bail!("HTTP {status}: {body_text}");
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                    sleep(Duration::from_millis(500)).await;
-                }
-            }
+    // A parseable reply carries the authoritative code, so prefer it even on a non-2xx status
+    // (a session limit, for instance, comes back as a 403 with a decoded statusCode).
+    if let Ok(payload) = serde_json::from_str::<CloudMatchResponse>(&body_text) {
+        if payload.request_status.status_code == 1 {
+            return parse_session_info(payload, base_url, identity);
         }
-        // Reached only by exhausting the retries: either transport errors (`last_err`) or a
-        // sustained 429/5xx, which leaves `last_err` empty.
-        match last_err {
-            Some(err) => Err(anyhow::Error::new(err)
-                .context("CloudMatch create session request failed")),
-            None => bail!(
-                "CloudMatch kept rejecting the launch after {throttled} throttled attempts - \
-                 NVIDIA is rate limiting this account, try again in a few minutes"
-            ),
-        }
-    };
+        return Err(payload.request_status.to_error(format!(
+            "CloudMatch create session error {} ({}): {body_text}",
+            payload.request_status.status_code,
+            payload.request_status.describe()
+        ))
+        .with_http_status(status.as_u16())
+        .into());
+    }
 
-    // Each limit-exceeded reply stops the zombie sessions it names and earns one retry; a
-    // second one can surface when several zombies were squatting on the device id at once.
-    let mut cleanups = 0;
-    let payload = loop {
-        let (payload, was_limit_exceeded) = send_request().await?;
-        if !was_limit_exceeded {
-            break payload;
-        }
-        if cleanups >= 2 {
-            // still hitting the limit after cleanup means its a session this device cant
-            // delete, report it as the per-device limit and let the error screen explain
-            return Err(GfnError::new(
-                GfnErrorCode::SESSION_LIMIT_PER_DEVICE_REACHED,
-                "CloudMatch still reported the session limit after cleanup",
-            )
-            .into());
-        }
-        cleanups += 1;
-        // No sleep here: `stop_conflicting_sessions` already waited for CloudMatch to confirm the
-        // slot was released before returning.
-    };
+    if status.is_success() {
+        bail!(
+            "CloudMatch create session response did not decode: {body_text}",
+        );
+    }
 
-    parse_session_info(payload, base_url, identity)
-}
-
-/// The server's own `Retry-After` (seconds form), clamped so a hostile or mistaken value can't
-/// park a launch for minutes.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let seconds: u64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_secs(seconds.clamp(1, 30)))
+    // 429 -> REQUEST_LIMIT_EXCEEDED, 5xx -> SERVER_INTERNAL_ERROR, anything else -> its own code.
+    // All fail the launch immediately: the reference client never retries these.
+    let error = GfnError::new(
+        GfnErrorCode::from_http_status(status.as_u16()).unwrap_or(GfnErrorCode::SERVER_INTERNAL_ERROR),
+        format!("HTTP {status}: {body_text}"),
+    );
+    return Err(error
+        .with_http_status(status.as_u16())
+        .into());
 }
 
 #[derive(Debug, Clone, Default)]
@@ -319,12 +215,14 @@ pub async fn poll_session(
     let base_url = request.session.streaming_base_url.trim_end_matches('/');
     let url = format!("{base_url}/v2/session/{}", request.session_id);
     let identity = &request.session.identity;
-    const MAX_ATTEMPTS: usize = 1800;
-    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+    const MAX_ATTEMPTS: usize = 720;
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
     // CloudMatch answers 5xx while a rig is being provisioned or its zone is loaded, and those
-    // stretches routinely outlast a handful of polls. Retrying on the flat 2s interval burned the
-    // whole allowance in ~22 seconds and killed launches that would have succeeded, so server
-    // errors back off instead - 12 retries now span a couple of minutes.
+    // stretches routinely outlast a handful of polls. Retrying on the flat 5s interval burned the
+    // whole allowance in ~55 seconds and killed launches that would have succeeded, so server
+    // errors back off instead - 12 retries now span a couple of minutes. 720 attempts at 5s
+    // keeps the same ~60-minute ceiling as before while halving the GET rate against CloudMatch
+    // (matches OpenNOW-Switch's 5s poll in ui_helpers.cpp).
     const MAX_CONSECUTIVE_SERVER_ERRORS: usize = 12;
     const SERVER_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(15);
     let mut consecutive_server_errors = 0usize;
@@ -601,103 +499,6 @@ pub async fn stop_session(client: &Client, token: &str, session: &SessionInfo) {
     }
 }
 
-/// Sessions CloudMatch still considers active for this account. Setup/queuing (1), ready (2)
-/// and streaming (3) all count against the per-device session limit. Mirrors OpenNOW's
-/// `getActiveSessions` (`GET /v2/session`).
-pub async fn get_active_sessions(
-    client: &Client,
-    token: &str,
-    identity: &SessionIdentity,
-) -> Result<Vec<String>> {
-    let base_url = DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/');
-    let url = format!("{base_url}/v2/session");
-
-    // Deliberately the launch's own identity rather than a fresh random one: CloudMatch scopes the
-    // per-device session limit by these headers, so listing under a different client id can hide
-    // the very sessions that are blocking us.
-    let response = headers::apply_cloudmatch_headers(
-        client.get(&url),
-        token,
-        &identity.client_id,
-        &identity.device_id,
-    )
-    .send()
-    .await?;
-    let body_text = response.text().await.unwrap_or_default();
-    let payload: GetSessionsResponse = match serde_json::from_str(&body_text) {
-        Ok(payload) => payload,
-        Err(error) => {
-            // Worth shouting about: the caller treats a failure here as "no zombies found", so a
-            // silent decode error looks exactly like a clean account while launches keep failing.
-            eprintln!("Could not read CloudMatch active sessions: {error}: {body_text}");
-            return Err(anyhow::Error::new(error)
-                .context("failed to decode CloudMatch active sessions response"));
-        }
-    };
-
-    Ok(payload
-        .sessions
-        .into_iter()
-        .filter(|s| s.status.occupies_device_slot())
-        .filter_map(|s| s.session_id.map(|id| id.as_string()))
-        .filter(|id| !id.is_empty())
-        .collect())
-}
-
-/// Deletes every session squatting on this device id: the ones the error payload names, or -
-/// when CloudMatch names none - every active session from `get_active_sessions` (OpenNOW's
-/// `stopActiveSessionsForCreate`). Returns true when at least one stop was issued, telling the
-/// caller a retry is worthwhile.
-async fn stop_conflicting_sessions(
-    client: &Client,
-    token: &str,
-    payload: Option<&CloudMatchResponse>,
-    identity: &SessionIdentity,
-    base_url: &str,
-) -> bool {
-    let mut old_ids = Vec::new();
-    if let Some(payload) = payload {
-        if let Some(session) = &payload.session
-            && let Some(id) = &session.session_id
-        {
-            old_ids.push(id.as_string());
-        }
-        for session in &payload.other_user_sessions {
-            if let Some(id) = &session.session_id {
-                old_ids.push(id.as_string());
-            }
-        }
-    }
-    if old_ids.is_empty() {
-        old_ids = get_active_sessions(client, token, identity)
-            .await
-            .unwrap_or_default();
-    }
-    old_ids.retain(|id| !id.is_empty());
-    // `dedup` only collapses *adjacent* duplicates, so the same id named by both the payload's
-    // session and `otherUserSessions` would otherwise be deleted twice.
-    old_ids.sort();
-    old_ids.dedup();
-
-    let mut stopped_any = false;
-    for old_id in &old_ids {
-        eprintln!("CloudMatch session limit hit; stopping zombie session {old_id}");
-        if stop_session_by_id(client, token, old_id, identity, base_url).await
-            == StopOutcome::Stopped
-        {
-            stopped_any = true;
-        }
-    }
-    if !stopped_any {
-        // Nothing was freed, so retrying the launch would just hit the same wall.
-        return false;
-    }
-    // A 200 on the DELETE only means NVIDIA accepted the request. Deprovisioning a rig that was
-    // mid-setup takes appreciably longer than that, and retrying the launch before the slot is
-    // actually released just spends an attempt on the same limit error.
-    wait_for_sessions_to_clear(client, token, identity).await
-}
-
 // cleans up a session we recorded but never confirmed closed (crash/force-quit path).
 // deletes at the recorded zone since that's the only place that knows about it.
 // mirrors OpenNOW-Switch's CleanupStaleCloudSession
@@ -718,7 +519,9 @@ async fn stop_remembered_session(client: &Client, token: &str, identity: &Sessio
     match stop_session_by_id(client, token, &stale.session_id, identity, base_url).await {
         StopOutcome::Stopped => {
             active_session::forget(&stale.session_id);
-            wait_for_sessions_to_clear(client, token, identity).await;
+            // a 200 on the DELETE is enough - no polling the slot for up to 24s like before,
+            // the launch POST below just needs the one request. matches Switch's
+            // CleanupStaleCloudSession which sends the DELETE and moves on.
         }
         StopOutcome::Forbidden => {
             eprintln!(
@@ -731,83 +534,6 @@ async fn stop_remembered_session(client: &Client, token: &str, identity: &Sessio
         // keep the note on failure, dont wanna lose track of it over a network blip
         StopOutcome::Failed => {}
     }
-}
-
-/// Ends every session CloudMatch still reports before a new launch is attempted.
-///
-/// Preemptive rather than reactive: GeForce NOW only allows one session at a time, so anything
-/// still open is going to reject this launch. Clearing it up front turns what used to be a failed
-/// launch plus two cleanup rounds into a launch that simply works.
-///
-/// Costs one GET when the account is already clear, which is the common case - the stopping and
-/// waiting only happen when there is genuinely something to remove.
-async fn stop_active_sessions_before_launch(
-    client: &Client,
-    token: &str,
-    identity: &SessionIdentity,
-    base_url: &str,
-) {
-    let Ok(active) = get_active_sessions(client, token, identity).await else {
-        // Can't tell, so just launch: the session-limit handler is still there as a backstop.
-        return;
-    };
-    if active.is_empty() {
-        return;
-    }
-
-    eprintln!(
-        "Ending {} session(s) still open before launching: {}",
-        active.len(),
-        active.join(", ")
-    );
-    let mut stopped_any = false;
-    for session_id in &active {
-        if stop_session_by_id(client, token, session_id, identity, base_url).await
-            == StopOutcome::Stopped
-        {
-            stopped_any = true;
-        }
-    }
-    if stopped_any {
-        wait_for_sessions_to_clear(client, token, identity).await;
-    }
-}
-
-/// Polls until CloudMatch stops reporting sessions on this device, or gives up.
-///
-/// Returns whether the device looks clear. Bounded well under the launch overlay's patience, so a
-/// server that never releases the slot still fails with an explanation rather than hanging.
-async fn wait_for_sessions_to_clear(
-    client: &Client,
-    token: &str,
-    identity: &SessionIdentity,
-) -> bool {
-    const MAX_CHECKS: usize = 8;
-    const CHECK_INTERVAL: Duration = Duration::from_secs(3);
-
-    for check in 0..MAX_CHECKS {
-        sleep(CHECK_INTERVAL).await;
-        match get_active_sessions(client, token, identity).await {
-            Ok(remaining) if remaining.is_empty() => {
-                eprintln!("CloudMatch device slot is clear after {}s", (check + 1) * 3);
-                return true;
-            }
-            Ok(remaining) => {
-                eprintln!(
-                    "Waiting for CloudMatch to release {} session(s): {}",
-                    remaining.len(),
-                    remaining.join(", ")
-                );
-            }
-            // Can't tell - assume it cleared rather than blocking a launch that might work.
-            Err(error) => {
-                eprintln!("Could not confirm CloudMatch session cleanup: {error:#}");
-                return true;
-            }
-        }
-    }
-    eprintln!("CloudMatch still reports active sessions after {MAX_CHECKS} checks");
-    false
 }
 
 fn is_ready_status(status: u32) -> bool {
