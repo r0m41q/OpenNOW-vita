@@ -96,6 +96,10 @@ pub struct CreateSessionRequest<'a> {
     pub app_id: &'a str,
     pub vpc_id: &'a str,
     pub settings: &'a StreamSettings,
+    /// When set, aim the creation POST at this zone's CloudMatch base instead of the default
+    /// `prod` host, and poll/stop the session there too (the reference client's
+    /// `resolveCreateSessionBase` "non-default base verbatim" rule).
+    pub streaming_base_url: Option<&'a str>,
 }
 
 /// CloudMatch session poll request.
@@ -117,7 +121,12 @@ pub async fn create_session(
         client_id: uuid::Uuid::new_v4().to_string(),
         device_id: super::auth::device_id(),
     };
-    let base_url = DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/');
+    // A chosen zone (manual server selection) overrides the default prod host, exactly like the
+    // reference's `resolveCreateSessionBase`; `None` is byte-for-byte the old behavior.
+    let base_url = request
+        .streaming_base_url
+        .unwrap_or(DEFAULT_CLOUDMATCH_BASE_URL)
+        .trim_end_matches('/');
     let (width, height) = request.settings.dimensions();
 
     let body = build_session_request_body(

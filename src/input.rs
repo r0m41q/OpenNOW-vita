@@ -60,8 +60,12 @@ pub enum AppCommand {
     SetRearTouchMode(crate::gfn::stream_prefs::RearTouchMode),
     /// Emitted by the volume-boost section of the account popup.
     SetAudioBoost(crate::gfn::stream_prefs::AudioBoost),
+    /// Emitted by the server-region picker in the settings modal (Auto = whole fleet).
+    SetStreamRegion(crate::gfn::regions::StreamRegion),
     /// Emitted when a row in the catalog list is tapped/clicked.
     SelectGame(usize),
+    /// Emitted when a row in the server-selection list is tapped/clicked (0 = Auto).
+    PickServer(usize),
     /// Toggles the streaming toolbar between expanded and collapsed.
     ToggleToolbar,
     /// Emits a momentary right-click to the host.

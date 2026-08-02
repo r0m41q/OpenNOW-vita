@@ -23,6 +23,8 @@ pub struct AppSettings {
     pub catalog_sort: String,
     #[serde(default = "default_rear_touch_mode")]
     pub rear_touch_mode: String,
+    #[serde(default = "default_stream_region")]
+    pub stream_region: String,
 }
 
 fn default_catalog_sort() -> String {
@@ -31,6 +33,10 @@ fn default_catalog_sort() -> String {
 
 fn default_rear_touch_mode() -> String {
     "quadrant".to_owned()
+}
+
+fn default_stream_region() -> String {
+    "auto".to_owned()
 }
 
 impl Default for AppSettings {
@@ -43,6 +49,7 @@ impl Default for AppSettings {
             stick_zones: "hidden".to_owned(),
             catalog_sort: "last_played".to_owned(),
             rear_touch_mode: "quadrant".to_owned(),
+            stream_region: "auto".to_owned(),
         }
     }
 }
@@ -350,4 +357,14 @@ pub fn rear_touch_mode() -> RearTouchMode {
 
 pub fn set_rear_touch_mode(mode: RearTouchMode) {
     update_settings(|s| s.rear_touch_mode = mode.as_text().to_owned());
+}
+
+/// Which region the server picker narrows to. `Auto` = whole fleet.
+pub fn stream_region() -> crate::gfn::regions::StreamRegion {
+    let s = load_or_init_settings();
+    crate::gfn::regions::StreamRegion::from_text(&s.stream_region)
+}
+
+pub fn set_stream_region(region: crate::gfn::regions::StreamRegion) {
+    update_settings(|s| s.stream_region = region.as_text().to_owned());
 }

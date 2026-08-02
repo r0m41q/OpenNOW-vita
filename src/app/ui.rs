@@ -2,6 +2,7 @@ use super::{App, AppState, CatalogSort};
 use crate::gfn::auth::GfnUser;
 use crate::gfn::catalog::GameSummary;
 use crate::gfn::covers::{CoverSize, CoverSnapshot, CoverStore};
+use crate::gfn::regions;
 use crate::i18n::{I18n, arg_string};
 use crate::input::AppCommand;
 use fluent_bundle::FluentArgs;
@@ -569,6 +570,26 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 commands.push(cmd);
             }
         }
+        AppState::ServerSelection {
+            games,
+            selected,
+            filtered_indices,
+            job,
+            candidates,
+            pick,
+            ..
+        } => {
+            commands.extend(server_selection_screen(
+                ctx,
+                &i18n,
+                &ServerSelectionView {
+                    game: selected_game(games, filtered_indices, *selected),
+                    loading: job.is_pending(),
+                    candidates,
+                    pick: *pick,
+                },
+            ));
+        }
         AppState::SessionReady {
             user,
             games,
@@ -995,6 +1016,189 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
     commands
 }
 
+/// Everything the server-selection screen needs.
+struct ServerSelectionView<'a> {
+    game: Option<&'a GameSummary>,
+    /// PrintedWaste fetch + pings still in flight.
+    loading: bool,
+    candidates: &'a [regions::ServerCandidate],
+    /// 0 = Auto, 1..=N = `candidates[pick - 1]`.
+    pick: usize,
+}
+
+/// Width of the picker's single centered column.
+const SERVER_LIST_WIDTH: f32 = 460.0;
+
+/// Manual server-selection screen shown between picking a game and creating the session: an
+/// Auto (best) row plus up to `SHORTLIST_SIZE` ranked servers with their PrintedWaste queue and
+/// measured ping. While the list is still loading only the Auto row is shown, so a quick confirm
+/// still launches (with default routing).
+fn server_selection_screen(
+    ctx: &egui::Context,
+    i18n: &I18n,
+    view: &ServerSelectionView<'_>,
+) -> Vec<AppCommand> {
+    let mut commands = Vec::new();
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(BG_DEEP))
+        .show(ctx, |ui| {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new(i18n.text("server-selection-title"))
+                        .strong()
+                        .size(22.0)
+                        .color(egui::Color32::WHITE),
+                );
+                if let Some(game) = view.game {
+                    ui.label(egui::RichText::new(&game.title).size(13.0).color(TEXT_DIM));
+                }
+                ui.add_space(8.0);
+                if view.loading {
+                    button_hint(
+                        ui,
+                        &i18n.text("server-selection-checking"),
+                        12.0,
+                        TEXT_DIM,
+                        true,
+                    );
+                }
+                ui.add_space(20.0);
+            });
+
+            ui.vertical_centered(|ui| {
+                ui.set_width(SERVER_LIST_WIDTH);
+
+                // Auto row (pick 0), always present and highlighted by default.
+                let (row_rect, response) = ui.allocate_exact_size(
+                    egui::vec2(SERVER_LIST_WIDTH, ROW_HEIGHT),
+                    egui::Sense::click(),
+                );
+                paint_server_row(ui.painter(), row_rect, view.pick == 0);
+                paint_server_row_label(
+                    ui.painter(),
+                    row_rect,
+                    &i18n.text("server-selection-auto"),
+                    16.0,
+                    view.pick == 0,
+                );
+                if response.clicked() {
+                    commands.push(AppCommand::PickServer(0));
+                }
+
+                for (index, candidate) in view.candidates.iter().enumerate() {
+                    let pick = index + 1;
+                    let is_selected = view.pick == pick;
+                    let (row_rect, response) = ui.allocate_exact_size(
+                        egui::vec2(SERVER_LIST_WIDTH, ROW_HEIGHT),
+                        egui::Sense::click(),
+                    );
+                    paint_server_row(ui.painter(), row_rect, is_selected);
+                    paint_server_row_label(
+                        ui.painter(),
+                        row_rect,
+                        &format!("{} {}", candidate.region, candidate.zone_id),
+                        16.0,
+                        is_selected,
+                    );
+                    let queue =
+                        text1(i18n, "server-selection-queue", "queue", candidate.queue_position);
+                    let ping = match candidate.ping_ms {
+                        Some(ms) => text1(i18n, "server-selection-ping-ms", "ping", ms),
+                        // Unmeasurable zones rank last; a dash beats a phantom number.
+                        None => "—".to_owned(),
+                    };
+                    paint_server_row_detail(
+                        ui.painter(),
+                        row_rect,
+                        &format!("{queue}  {ping}"),
+                        is_selected,
+                    );
+                    if response.clicked() {
+                        commands.push(AppCommand::PickServer(pick));
+                    }
+                }
+            });
+
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                button_hint(
+                    ui,
+                    &i18n.text("server-selection-hint"),
+                    11.0,
+                    TEXT_DIM,
+                    true,
+                );
+            });
+        });
+
+    commands
+}
+
+/// Backdrop + accent frame for one picker row, mirroring the catalog's list-row idiom.
+fn paint_server_row(painter: &egui::Painter, row_rect: egui::Rect, is_selected: bool) {
+    let rect = row_rect.shrink2(egui::vec2(0.0, 1.5));
+    painter.rect_filled(rect, 6.0, if is_selected { BG_RAISED } else { BG_PANEL });
+    if is_selected {
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(1.5, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                rect.min + egui::vec2(2.0, 4.0),
+                egui::vec2(3.0, rect.height() - 8.0),
+            ),
+            1.5,
+            ACCENT,
+        );
+    }
+}
+
+/// Left-aligned row label ("Auto (best)" or a `{region} {zone}`).
+fn paint_server_row_label(
+    painter: &egui::Painter,
+    row_rect: egui::Rect,
+    label: &str,
+    size: f32,
+    is_selected: bool,
+) {
+    painter.text(
+        egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(size),
+        if is_selected {
+            egui::Color32::WHITE
+        } else {
+            TEXT_DIM
+        },
+    );
+}
+
+/// Right-aligned queue + ping summary for a server row.
+fn paint_server_row_detail(
+    painter: &egui::Painter,
+    row_rect: egui::Rect,
+    detail: &str,
+    is_selected: bool,
+) {
+    painter.text(
+        egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        detail,
+        egui::FontId::proportional(14.0),
+        if is_selected {
+            egui::Color32::WHITE
+        } else {
+            TEXT_DIM
+        },
+    );
+}
+
 /// First-run explainer for the buttons the Vita does not physically have.
 ///
 /// Animated deliberately: the quadrants light up one after another, because a static diagram of a
@@ -1289,6 +1493,17 @@ fn language_picker(
                         |candidate| format!("{}x", candidate.percent() / 100),
                     ) {
                         command = Some(AppCommand::SetAudioBoost(chosen));
+                    }
+
+                    if let Some(chosen) = settings_row(
+                        ui,
+                        i18n,
+                        "settings-region-heading",
+                        crate::gfn::regions::StreamRegion::ALL.iter().copied(),
+                        crate::gfn::stream_prefs::stream_region(),
+                        |candidate| i18n.text(candidate.label_key()),
+                    ) {
+                        command = Some(AppCommand::SetStreamRegion(chosen));
                     }
                 });
             close_requested

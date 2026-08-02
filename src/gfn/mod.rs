@@ -12,4 +12,5 @@ pub mod signaling;
 pub mod stream_prefs;
 pub mod sdp;
 pub mod peer;
+pub mod regions;
 pub mod rtp;
