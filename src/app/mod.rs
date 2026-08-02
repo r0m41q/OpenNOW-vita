@@ -620,6 +620,13 @@ impl App {
             AppCommand::RightClick => {
                 current_state
             }
+            AppCommand::TapHomeButton => {
+                // Stateless in the app: just stamps the shared tap timestamp. The guide bit only
+                // travels in gamepad snapshots, which are only sent while streaming, so tapping
+                // outside a session is harmless.
+                crate::input::home_button::tap();
+                current_state
+            }
             AppCommand::ToggleControlsModal => {
                 self.show_controls_modal = !self.show_controls_modal;
                 current_state

@@ -229,7 +229,12 @@ pub async fn run(mut app: App) -> Result<()> {
             }
             surface.sync_video_frame(streaming_peer)?;
             if let (Some(peer), Some(active_controller)) = (streaming_peer, controller.as_ref()) {
-                peer.send_gamepad(gamepad_snapshot(active_controller, &rear_touch, &stick_zones));
+                peer.send_gamepad(gamepad_snapshot(
+                    active_controller,
+                    &rear_touch,
+                    &stick_zones,
+                    crate::input::home_button::is_pressed(),
+                ));
                 crate::input::stick_zone_stats::record_clicks(
                     stick_zones.left_stick_click(),
                     stick_zones.right_stick_click(),
@@ -368,7 +373,12 @@ pub async fn run(mut app: App) -> Result<()> {
                 if let (AppState::Streaming { peer, .. }, Some(active_controller)) =
                     (&app.state, controller.as_ref())
                 {
-                    peer.send_gamepad(gamepad_snapshot(active_controller, &rear_touch, &stick_zones));
+                    peer.send_gamepad(gamepad_snapshot(
+                        active_controller,
+                        &rear_touch,
+                        &stick_zones,
+                        crate::input::home_button::is_pressed(),
+                    ));
                 crate::input::stick_zone_stats::record_clicks(
                     stick_zones.left_stick_click(),
                     stick_zones.right_stick_click(),

@@ -156,6 +156,7 @@ enum StreamIcon {
     Stats,
     Power,
     Mouse,
+    Home,
     Collapse,
     Expand,
     Controls,
@@ -230,6 +231,22 @@ fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon
             painter.line_segment([tl, bot], s);
             painter.line_segment([tl, rt], s);
             painter.line_segment([bot, rt], s);
+        }
+        // A house: triangle roof over a square body, in one stroke so it reads at 14px.
+        StreamIcon::Home => {
+            let s = egui::Stroke::new(1.5_f32, tint);
+            let inset = rect.shrink2(egui::vec2(2.5, 2.0));
+            let (x, y, w, h) = (inset.min.x, inset.min.y, inset.width(), inset.height());
+            let roof_apex = egui::pos2(x + w / 2.0, y);
+            let wall_l = egui::pos2(x + w * 0.15, y + h * 0.35);
+            let wall_r = egui::pos2(x + w * 0.85, y + h * 0.35);
+            let base_l = egui::pos2(x + w * 0.15, y + h);
+            let base_r = egui::pos2(x + w * 0.85, y + h);
+            painter.line_segment([roof_apex, wall_l], s);
+            painter.line_segment([roof_apex, wall_r], s);
+            painter.line_segment([wall_l, base_l], s);
+            painter.line_segment([base_l, base_r], s);
+            painter.line_segment([base_r, wall_r], s);
         }
         StreamIcon::Collapse => {
             let s = egui::Stroke::new(2.0_f32, tint);
@@ -2554,7 +2571,14 @@ fn streaming_screen(
                         command = Some(AppCommand::ToggleKeyboard);
                     }
 
-                    // 6. Collapse ◀
+                    // 6. Home (Guide) — a momentary tap, so no active state to reflect
+                    let home = stream_icon_button(ui, StreamIcon::Home, TEXT_DIM);
+                    reserve_stream_touch(ui.ctx(), home.rect);
+                    if home.clicked() {
+                        command = Some(AppCommand::TapHomeButton);
+                    }
+
+                    // 7. Collapse ◀
                     let collapse = stream_icon_button(ui, StreamIcon::Collapse, ACCENT);
                     reserve_stream_touch(ui.ctx(), collapse.rect);
                     if collapse.clicked() {

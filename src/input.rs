@@ -66,6 +66,8 @@ pub enum AppCommand {
     ToggleToolbar,
     /// Emits a momentary right-click to the host.
     RightClick,
+    /// Momentary gamepad Guide/Home press, from the streaming toolbar's Home button.
+    TapHomeButton,
     /// Toggles the in-stream controls configuration modal (L2/R2 and L3/R3).
     ToggleControlsModal,
     /// Toggles front touch trackpad host mouse input on and off.
@@ -613,12 +615,68 @@ impl RearTouchTriggers {
     }
 }
 
+/// XInput's Guide (Home) button bit, matching `XINPUT_GAMEPAD_GUIDE` and the desktop client's
+/// `GAMEPAD_GUIDE`. The Vita has no physical Guide button, so the toolbar's Home button is the
+/// only source of this bit.
+pub const GAMEPAD_GUIDE: u16 = 0x0400;
+
+/// ORs the Guide bit into a buttons mask while the Guide button is held. A separate function (not
+/// inline in `gamepad_snapshot`) so the bit logic is testable without a live controller.
+fn apply_guide_bit(mut buttons: u16, guide_held: bool) -> u16 {
+    if guide_held {
+        buttons |= GAMEPAD_GUIDE;
+    }
+    buttons
+}
+
+/// Momentary "Home"/Guide-button tap state, shared between the app and the shell's gamepad
+/// snapshots - the same `stick_zone_stats` atomic pattern.
+///
+/// The Vita has no physical Guide button, so the streaming toolbar's Home button is the only way
+/// to raise the host's Guide bit. The toolbar taps here; the shell reads `is_pressed()` each
+/// snapshot and feeds the result into `gamepad_snapshot` as `guide_held`.
+pub mod home_button {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    /// How long a single tap holds the Guide bit asserted. A second tap inside the window extends
+    /// it.
+    pub const HOME_TAP_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
+
+    static TAPPED_AT: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+    /// Monotonic microseconds since the module's first use, so taps keep a stable ordering even
+    /// across wall-clock changes.
+    fn now_micros() -> u64 {
+        let epoch = *EPOCH.get_or_init(Instant::now);
+        epoch.elapsed().as_micros() as u64
+    }
+
+    /// Whether a tap stamped at `tapped_us` is still inside its hold window at `now_us`.
+    pub(crate) fn within_hold(now_us: u64, tapped_us: u64) -> bool {
+        now_us.saturating_sub(tapped_us) < HOME_TAP_HOLD.as_micros() as u64
+    }
+
+    /// Stamp a momentary Guide press.
+    pub fn tap() {
+        TAPPED_AT.store(now_micros(), Ordering::Relaxed);
+    }
+
+    /// True while the most recent tap's hold window is still open.
+    pub fn is_pressed() -> bool {
+        within_hold(now_micros(), TAPPED_AT.load(Ordering::Relaxed))
+    }
+}
+
 /// Full controller snapshot for the streaming session, in XInput conventions (the format the NVST
 /// input channel speaks - see `gfn::input_protocol`).
 pub fn gamepad_snapshot(
     controller: &GameController,
     rear_touch: &RearTouchTriggers,
     stick_zones: &FrontStickZones,
+    guide_held: bool,
 ) -> crate::gfn::input_protocol::GamepadInput {
     const DPAD_UP: u16 = 0x0001;
     const DPAD_DOWN: u16 = 0x0002;
@@ -664,6 +722,9 @@ pub fn gamepad_snapshot(
         buttons |= RIGHT_THUMB;
     }
 
+    // The toolbar's Home button raises the Guide bit for a momentary hold.
+    let buttons = apply_guide_bit(buttons, guide_held);
+
     let axis = |axis: Axis| controller.axis(axis);
     let trigger = |value: i16| (value.max(0) / 129).min(255) as u8;
 
@@ -707,5 +768,58 @@ mod stick_zone_tests {
     fn the_zones_only_cover_the_bottom_third() {
         assert!(!is_in_stick_zone(0.05, STICK_ZONE_TOP - 0.01));
         assert!(is_in_stick_zone(0.05, STICK_ZONE_TOP + 0.01));
+    }
+}
+
+#[cfg(test)]
+mod home_button_tests {
+    use super::*;
+
+    /// The Guide bit is XInput's `0x0400`, unused by any of the other button masks.
+    #[test]
+    fn guide_bit_is_unused_by_other_buttons() {
+        assert_eq!(GAMEPAD_GUIDE, 0x0400);
+        let used_bits = [
+            0x0001, 0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040, 0x0080, 0x0100, 0x0200,
+            0x1000, 0x2000, 0x4000, 0x8000,
+        ];
+        for bit in used_bits {
+            assert_eq!(bit & GAMEPAD_GUIDE, 0, "0x{bit:04X} collides with the Guide bit");
+        }
+    }
+
+    /// `guide_held` raises exactly the Guide bit and nothing else.
+    #[test]
+    fn guide_held_raises_only_the_guide_bit() {
+        assert_eq!(apply_guide_bit(0, true), GAMEPAD_GUIDE);
+        assert_eq!(apply_guide_bit(0x0001, true), 0x0001 | GAMEPAD_GUIDE);
+        assert_eq!(apply_guide_bit(0x0001, false), 0x0001);
+    }
+
+    /// A just-stamped tap is immediately inside its hold window.
+    #[test]
+    fn a_tap_is_pressed_immediately() {
+        home_button::tap();
+        assert!(home_button::is_pressed(), "a fresh tap must be inside its hold window");
+    }
+
+    /// The hold-window boundary is exclusive: just inside is pressed, at the edge it has cleared.
+    #[test]
+    fn the_hold_clears_at_the_window_edge() {
+        let hold_us = home_button::HOME_TAP_HOLD.as_micros() as u64;
+        let tapped = 1_000_000;
+        assert!(home_button::within_hold(tapped + hold_us - 1, tapped));
+        assert!(!home_button::within_hold(tapped + hold_us, tapped));
+    }
+
+    /// Tapping again inside the window re-arms it for a full hold from the second tap.
+    #[test]
+    fn a_second_tap_inside_the_hold_extends_it() {
+        let hold_us = home_button::HOME_TAP_HOLD.as_micros() as u64;
+        let first = 1_000_000;
+        let retap = first + hold_us * 100 / 120; // 100 ms into the first hold
+        let now = retap + hold_us - 1;
+        assert!(home_button::within_hold(now, retap), "re-tap stays pressed through its new window");
+        assert!(!home_button::within_hold(now, first), "the first tap's window has long closed");
     }
 }
