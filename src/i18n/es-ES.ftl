@@ -57,6 +57,23 @@ session-step-ready = Lista
 session-preparing-rig = Preparando tu equipo en la nube
 session-ready-headline = Tu equipo está listo
 
+# Selección de servidor
+server-selection-title = Elige un servidor
+server-selection-checking = Comprobando servidores...
+server-selection-auto = Auto (mejor)
+server-selection-ping-ms = { $ping } ms
+server-selection-queue = Cola: { $queue }
+server-selection-unavailable = Lista de servidores no disponible - se lanza con la ruta automática.
+server-selection-hint = Arriba/Abajo para elegir · Confirmar (X) para lanzar · Atrás (O) para cancelar
+server-region-auto = Auto
+server-region-us = Norteamérica (US)
+server-region-eu = Europa (EU)
+server-region-jp = Japón (JP)
+server-region-kr = Corea (KR)
+server-region-ca = Canadá (CA)
+server-region-in = India (IN)
+server-region-sea = Sudeste asiático (TH/MY)
+
 # Sesión lista (pantalla de depuración/transición)
 session-ready-hint = Pulsa Confirmar (X) para conectar la señalización de NVIDIA.
 
@@ -124,6 +141,7 @@ settings-heading = Ajustes
 settings-title = Ajustes de controles
 account-close = Cerrar
 settings-language-heading = Idioma
+settings-region-heading = Región de servidor
 controls-hint-heading = Controles de Vita
 controls-hint-rear = El panel trasero sustituye a los botones que esta consola no tiene:
 controls-hint-touch = La pantalla tactil mueve el raton; toca para hacer clic.
@@ -180,6 +198,8 @@ error-gfn-session-list-limit-exceeded-title = Demasiadas sesiones
 error-gfn-session-list-limit-exceeded-body = Tienes demasiadas sesiones activas. Cierra alguna e inténtalo otra vez.
 error-gfn-session-limit-exceeded-title = Límite de sesiones alcanzado
 error-gfn-session-limit-exceeded-body = Has llegado a tu límite de sesiones. Puede que ya haya otra en marcha en tu cuenta.
+error-gfn-rate-limited-title = GeForce NOW está saturado ahora mismo
+error-gfn-rate-limited-body = NVIDIA está limitando los lanzamientos de esta cuenta porque recibió demasiados en poco tiempo. Espera unos minutos antes de intentarlo de nuevo: reintentar más rápido solo mantiene la limitación activa.
 error-gfn-session-entitled-time-exceeded-title = Tiempo de sesión agotado
 error-gfn-session-entitled-time-exceeded-body = Has agotado tu tiempo de sesión.
 error-gfn-auth-failure-title = Falló la autenticación

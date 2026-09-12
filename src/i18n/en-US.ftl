@@ -57,6 +57,23 @@ session-step-ready = Ready
 session-preparing-rig = Preparing your cloud rig
 session-ready-headline = Your rig is ready
 
+# Server selection
+server-selection-title = Choose a server
+server-selection-checking = Checking servers...
+server-selection-auto = Auto (best)
+server-selection-ping-ms = { $ping } ms
+server-selection-queue = Queue: { $queue }
+server-selection-unavailable = Server list unavailable - launching with the best automatic route.
+server-selection-hint = Up/Down to pick · Confirm (X) to launch · Back (O) to cancel
+server-region-auto = Auto
+server-region-us = North America (US)
+server-region-eu = Europe (EU)
+server-region-jp = Japan (JP)
+server-region-kr = Korea (KR)
+server-region-ca = Canada (CA)
+server-region-in = India (IN)
+server-region-sea = Southeast Asia (TH/MY)
+
 # Session ready (debug/transition screen)
 session-ready-hint = Press Confirm (X) to connect NVIDIA's signaling.
 
@@ -124,6 +141,7 @@ settings-heading = Settings
 settings-title = Settings
 account-close = Close
 settings-language-heading = Language
+settings-region-heading = Server region
 controls-hint-heading = Vita controls
 controls-hint-rear = The rear panel stands in for the buttons this console does not have:
 controls-hint-touch = The front touchscreen moves the mouse; tap to click.
@@ -180,6 +198,8 @@ error-gfn-session-list-limit-exceeded-title = Too Many Sessions
 error-gfn-session-list-limit-exceeded-body = You have too many active sessions. Please close some sessions and try again.
 error-gfn-session-limit-exceeded-title = Session Limit Exceeded
 error-gfn-session-limit-exceeded-body = You have reached your session limit. Another session may already be running on your account.
+error-gfn-rate-limited-title = GeForce NOW is busy right now
+error-gfn-rate-limited-body = NVIDIA is throttling launches from this account because it got too many too quickly. Wait a few minutes before trying again - retrying faster only keeps the throttle armed.
 error-gfn-session-entitled-time-exceeded-title = Session Time Exceeded
 error-gfn-session-entitled-time-exceeded-body = Your session time has been exceeded.
 error-gfn-auth-failure-title = Authentication Failed

@@ -4,6 +4,7 @@ use crate::gfn::auth::{self, AuthTokens, DeviceCodeChallenge, DevicePollOutcome,
 use crate::gfn::catalog::{self, GameSummary};
 use crate::gfn::cloudmatch::{self, SessionInfo};
 use crate::gfn::covers::{self, CoverStore};
+use crate::gfn::regions;
 use crate::gfn::signaling::{self, SignalingEvent, SignalingHandle};
 use crate::input::{AppCommand, InputCommand};
 use crate::jobs::{PollJob, poll_job};
@@ -315,6 +316,24 @@ pub enum AppState {
         job: PollJob<SessionInfo>,
         queue_tracker: cloudmatch::QueueProgressTracker,
     },
+    /// Manual server-selection picker between picking a game and creating the session: fetches
+    /// the PrintedWaste queue list, pings the top candidates, and lets the player aim the launch
+    /// at a specific zone (or stick with Auto = best-ranked).
+    ServerSelection {
+        user: GfnUser,
+        games: Vec<GameSummary>,
+        selected: usize,
+        filtered_indices: Vec<usize>,
+        search_query: String,
+        search_requested: bool,
+        covers: CoverStore,
+        /// PrintedWaste fetch + pings in flight; `Done(Ok(_))` once the shortlist is cached.
+        job: PollJob<Vec<regions::ServerCandidate>>,
+        /// Ranked shortlist (empty while the job is still running).
+        candidates: Vec<regions::ServerCandidate>,
+        /// 0 = Auto (best), 1..=N = `candidates[pick - 1]`.
+        pick: usize,
+    },
     /// CloudMatch session is ready.
     SessionReady {
         user: GfnUser,
@@ -568,6 +587,10 @@ impl App {
                 }
                 current_state
             }
+            AppCommand::SetStreamRegion(region) => {
+                crate::gfn::stream_prefs::set_stream_region(region);
+                current_state
+            }
             AppCommand::SetStickZones(zones) => {
                 crate::gfn::stream_prefs::set_stick_zones(zones);
                 if zones != crate::gfn::stream_prefs::StickZones::Off {
@@ -620,6 +643,13 @@ impl App {
             AppCommand::RightClick => {
                 current_state
             }
+            AppCommand::TapHomeButton => {
+                // Stateless in the app: just stamps the shared tap timestamp. The guide bit only
+                // travels in gamepad snapshots, which are only sent while streaming, so tapping
+                // outside a session is harmless.
+                crate::input::home_button::tap();
+                current_state
+            }
             AppCommand::ToggleControlsModal => {
                 self.show_controls_modal = !self.show_controls_modal;
                 current_state
@@ -670,6 +700,15 @@ impl App {
                     && index < filtered_indices.len()
                 {
                     *selected = index;
+                }
+                state
+            }
+            AppCommand::PickServer(index) => {
+                let mut state = current_state;
+                if let AppState::ServerSelection { candidates, pick, .. } = &mut state
+                    && index < candidates.len() + 1
+                {
+                    *pick = index;
                 }
                 state
             }
@@ -1009,61 +1048,19 @@ impl App {
                     }
                 } else {
                     let game_index = filtered_indices.get(selected).copied();
-                    match (
-                        game_index.and_then(|index| games.get(index)),
-                        bearer_token.clone(),
-                    ) {
-                        (Some(game), Some(token)) => {
-                            let app_id = game.app_id.clone();
-                            let queue_tracker = Arc::new(std::sync::Mutex::new(
-                                cloudmatch::QueueStatus::default(),
-                            ));
-                            let tracker_clone = queue_tracker.clone();
-                            // Republished for the cancel path; cleared here so a cancelled launch
-                            // can't leave the previous attempt's session behind to be stopped
-                            // twice.
-                            if let Ok(mut slot) = self.launching_session.lock() {
-                                *slot = None;
-                            }
-                            self.launch_was_queued = false;
-                            let launching_session = self.launching_session.clone();
-                            let handle: JoinHandle<Result<SessionInfo>> =
+                    match (game_index.and_then(|index| games.get(index)), bearer_token) {
+                        (Some(_game), Some(_token)) => {
+                            // Manual server selection sits between picking a game and launching.
+                            // Kick off the PrintedWaste fetch + pings in the background, narrowed
+                            // to the saved region (Auto = whole fleet); the token is picked up
+                            // later when the confirmed row launches the session.
+                            let fetch_client = http_client.clone();
+                            let region = crate::gfn::stream_prefs::stream_region();
+                            let handle: JoinHandle<Result<Vec<regions::ServerCandidate>>> =
                                 tokio::spawn(async move {
-                                    let settings = cloudmatch::StreamSettings::for_vita();
-                                    let session = cloudmatch::create_session(
-                                        &http_client,
-                                        cloudmatch::CreateSessionRequest {
-                                            token: token.as_str(),
-                                            app_id: &app_id,
-                                            vpc_id: "",
-                                            settings: &settings,
-                                        },
-                                    )
-                                    .await?;
-                                    if let Ok(mut slot) = launching_session.lock() {
-                                        *slot = Some(session.clone());
-                                    }
-                                    let polled = cloudmatch::poll_session(
-                                        &http_client,
-                                        cloudmatch::PollSessionRequest {
-                                            token: token.as_str(),
-                                            session_id: &session.session_id,
-                                            session: &session,
-                                        },
-                                        Some(tracker_clone),
-                                    )
-                                    .await;
-                                    if polled.is_err() {
-                                        cloudmatch::stop_session(
-                                            &http_client,
-                                            token.as_str(),
-                                            &session,
-                                        )
-                                        .await;
-                                    }
-                                    polled
+                                    regions::load_best_servers(&fetch_client, region).await
                                 });
-                            AppState::CreatingSession {
+                            AppState::ServerSelection {
                                 user,
                                 games,
                                 selected,
@@ -1072,7 +1069,8 @@ impl App {
                                 search_requested,
                                 covers,
                                 job: PollJob::Pending(handle),
-                                queue_tracker,
+                                candidates: Vec::new(),
+                                pick: 0,
                             }
                         }
                         _ => {
@@ -1132,6 +1130,122 @@ impl App {
                 }
             }
             (
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job,
+                    candidates,
+                    pick,
+                },
+                InputCommand::MoveUp,
+            ) => {
+                // D-pad navigation over the Auto + server rows. While the list is still loading
+                // `candidates` is empty, so the row count is 1 and the selection stays on Auto.
+                let pick = move_in_list(candidates.len() + 1, pick, ListStep::Up);
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job,
+                    candidates,
+                    pick,
+                }
+            }
+            (
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job,
+                    candidates,
+                    pick,
+                },
+                InputCommand::MoveDown,
+            ) => {
+                let pick = move_in_list(candidates.len() + 1, pick, ListStep::Down);
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job,
+                    candidates,
+                    pick,
+                }
+            }
+            (
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job,
+                    candidates,
+                    pick,
+                },
+                InputCommand::Confirm,
+            ) => self.advance_server_selection(
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+                job,
+                candidates,
+                pick,
+            ),
+            (
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job,
+                    ..
+                },
+                InputCommand::Back,
+            ) => {
+                // Cancel the picker: back to the catalog, no session created. The still-running
+                // fetch job is dropped with the state; aborting it keeps the pings from burning
+                // Wi-Fi after the player already left the screen.
+                if let PollJob::Pending(handle) = job {
+                    handle.abort();
+                }
+                AppState::Catalog {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                }
+            }
+            (
                 state @ (AppState::CreatingSession { .. }
                 | AppState::SessionReady { .. }
                 | AppState::Signaling { .. }),
@@ -1186,7 +1300,6 @@ impl App {
             }
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::RestartLogin,
                     ..
                 },
@@ -1194,7 +1307,6 @@ impl App {
             ) => self.start_login_state(),
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::ReloadCatalog(user),
                     ..
                 },
@@ -1210,7 +1322,6 @@ impl App {
             }
             (
                 AppState::Error {
-                    code: None,
                     retry:
                         ErrorRetry::BackToCatalog {
                             user,
@@ -1238,7 +1349,6 @@ impl App {
             // recoverable as a failed launch.
             (
                 AppState::Error {
-                    code: None,
                     retry:
                         ErrorRetry::BackToCatalog {
                             user,
@@ -1263,7 +1373,6 @@ impl App {
             },
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::ReloadCatalog(user),
                     ..
                 },
@@ -1279,7 +1388,6 @@ impl App {
             }
             (
                 AppState::Error {
-                    code: None,
                     retry: ErrorRetry::RestartLogin,
                     ..
                 },
@@ -1607,6 +1715,13 @@ impl App {
                 covers,
                 ..
             }
+            | AppState::ServerSelection {
+                games,
+                selected,
+                filtered_indices,
+                covers,
+                ..
+            }
             | AppState::SessionReady {
                 games,
                 selected,
@@ -1681,6 +1796,33 @@ impl App {
                     queue_tracker,
                 )
                 .await
+            }
+            AppState::ServerSelection {
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+                job,
+                candidates,
+                pick,
+            } => {
+                self.state = self
+                    .advance_server_selection_job(
+                        user,
+                        games,
+                        selected,
+                        filtered_indices,
+                        search_query,
+                        search_requested,
+                        covers,
+                        job,
+                        candidates,
+                        pick,
+                    )
+                    .await
             }
             AppState::Signaling {
                 user,
@@ -2209,6 +2351,242 @@ impl App {
                         retry: ErrorRetry::ReloadCatalog(user),
                     }
                 }
+            }
+        }
+    }
+
+    /// The zone base a confirmed `pick` resolves to: `None` for Auto (launch the best-ranked
+    /// server once one has a measured ping, else default `prod` routing) or when the list hasn't
+    /// loaded yet, and the picked server's zone otherwise.
+    fn selected_server_base(
+        candidates: &[regions::ServerCandidate],
+        pick: usize,
+    ) -> Option<String> {
+        if pick == 0 {
+            return candidates
+                .first()
+                .filter(|candidate| candidate.ping_ms.is_some())
+                .map(|candidate| candidate.streaming_base_url.clone());
+        }
+        candidates
+            .get(pick - 1)
+            .map(|candidate| candidate.streaming_base_url.clone())
+    }
+
+    /// Spawns the CloudMatch create+wait task for a confirmed launch and returns the
+    /// `CreatingSession` state. `streaming_base_url: None` = default `prod` routing (Auto with no
+    /// measurable best server, or a list that never loaded).
+    fn spawn_session_creation(
+        &mut self,
+        user: GfnUser,
+        games: Vec<GameSummary>,
+        selected: usize,
+        filtered_indices: Vec<usize>,
+        search_query: String,
+        search_requested: bool,
+        covers: CoverStore,
+        streaming_base_url: Option<String>,
+    ) -> AppState {
+        let Some(token) = self.bearer_token().map(str::to_owned) else {
+            self.status_note = Some(self.tr("status-session-start-failed"));
+            return AppState::Catalog {
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+            };
+        };
+        let Some(app_id) = filtered_indices
+            .get(selected)
+            .and_then(|&index| games.get(index))
+            .map(|game| game.app_id.clone())
+        else {
+            self.status_note = Some(self.tr("status-session-start-failed"));
+            return AppState::Catalog {
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+            };
+        };
+        let http_client = self.http_client.clone();
+        let queue_tracker = Arc::new(std::sync::Mutex::new(
+            cloudmatch::QueueStatus::default(),
+        ));
+        let tracker_clone = queue_tracker.clone();
+        // Republished for the cancel path; cleared here so a cancelled launch can't leave the
+        // previous attempt's session behind to be stopped twice.
+        if let Ok(mut slot) = self.launching_session.lock() {
+            *slot = None;
+        }
+        self.launch_was_queued = false;
+        let launching_session = self.launching_session.clone();
+        let handle: JoinHandle<Result<SessionInfo>> = tokio::spawn(async move {
+            let settings = cloudmatch::StreamSettings::for_vita();
+            let session = cloudmatch::create_session(
+                &http_client,
+                cloudmatch::CreateSessionRequest {
+                    token: token.as_str(),
+                    app_id: &app_id,
+                    vpc_id: "",
+                    settings: &settings,
+                    streaming_base_url: streaming_base_url.as_deref(),
+                },
+            )
+            .await?;
+            if let Ok(mut slot) = launching_session.lock() {
+                *slot = Some(session.clone());
+            }
+            let polled = cloudmatch::poll_session(
+                &http_client,
+                cloudmatch::PollSessionRequest {
+                    token: token.as_str(),
+                    session_id: &session.session_id,
+                    session: &session,
+                },
+                Some(tracker_clone),
+            )
+            .await;
+            if polled.is_err() {
+                cloudmatch::stop_session(&http_client, token.as_str(), &session).await;
+            }
+            polled
+        });
+        AppState::CreatingSession {
+            user,
+            games,
+            selected,
+            filtered_indices,
+            search_query,
+            search_requested,
+            covers,
+            job: PollJob::Pending(handle),
+            queue_tracker,
+        }
+    }
+
+    /// Confirmed a row in the server picker: turn `pick` into a `CreatingSession` launch. A
+    /// confirm while the fetch is still loading means "launch now, NVIDIA picks" - default
+    /// routing, so a quick double-press never stalls on the list.
+    fn advance_server_selection(
+        &mut self,
+        user: GfnUser,
+        games: Vec<GameSummary>,
+        selected: usize,
+        filtered_indices: Vec<usize>,
+        search_query: String,
+        search_requested: bool,
+        covers: CoverStore,
+        job: PollJob<Vec<regions::ServerCandidate>>,
+        candidates: Vec<regions::ServerCandidate>,
+        pick: usize,
+    ) -> AppState {
+        if let PollJob::Pending(handle) = job {
+            handle.abort();
+            return self.spawn_session_creation(
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+                None,
+            );
+        }
+        let base = Self::selected_server_base(&candidates, pick);
+        self.spawn_session_creation(
+            user,
+            games,
+            selected,
+            filtered_indices,
+            search_query,
+            search_requested,
+            covers,
+            base,
+        )
+    }
+
+    /// Polls the picker's fetch+pings job: on success caches the ranked shortlist and keeps the
+    /// picker open, on failure skips the picker and launches with default routing (a brief
+    /// `status_note` tells the player the list never came).
+    async fn advance_server_selection_job(
+        &mut self,
+        user: GfnUser,
+        games: Vec<GameSummary>,
+        selected: usize,
+        filtered_indices: Vec<usize>,
+        search_query: String,
+        search_requested: bool,
+        covers: CoverStore,
+        job: PollJob<Vec<regions::ServerCandidate>>,
+        candidates: Vec<regions::ServerCandidate>,
+        pick: usize,
+    ) -> AppState {
+        let PollJob::Pending(handle) = job else {
+            return AppState::ServerSelection {
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+                job,
+                candidates,
+                pick,
+            };
+        };
+        match poll_job(handle).await {
+            PollJob::Pending(handle) => AppState::ServerSelection {
+                user,
+                games,
+                selected,
+                filtered_indices,
+                search_query,
+                search_requested,
+                covers,
+                job: PollJob::Pending(handle),
+                candidates,
+                pick,
+            },
+            PollJob::Done(Ok(loaded)) => {
+                // The shortlist arrived; keep the picker open with it cached. `pick` was clamped
+                // to Auto (0) while `candidates` was empty, so it stays on Auto.
+                let pick = pick.min(loaded.len());
+                AppState::ServerSelection {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job: PollJob::Done(Ok(loaded.clone())),
+                    candidates: loaded,
+                    pick,
+                }
+            }
+            PollJob::Done(Err(_)) => {
+                // The list could not be fetched or contained no standard zones - launch with
+                // default routing rather than park the player on an empty picker.
+                self.status_note = Some(self.tr("server-selection-unavailable"));
+                self.spawn_session_creation(
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    None,
+                )
             }
         }
     }
